@@ -363,24 +363,27 @@ func (ci *ClientInfo) forAdvisory() *ClientInfo {
 
 // ServerStats hold various statistics that we will periodically send out.
 type ServerStats struct {
-	Start              time.Time           `json:"start"`
-	Mem                int64               `json:"mem"`
-	Cores              int                 `json:"cores"`
-	CPU                float64             `json:"cpu"`
-	Connections        int                 `json:"connections"`
-	TotalConnections   uint64              `json:"total_connections"`
-	ActiveAccounts     int                 `json:"active_accounts"`
-	NumSubs            uint32              `json:"subscriptions"`
-	Sent               DataStats           `json:"sent"`
-	Received           DataStats           `json:"received"`
-	SlowConsumers      int64               `json:"slow_consumers"`
-	SlowConsumersStats *SlowConsumersStats `json:"slow_consumer_stats,omitempty"`
-	Routes             []*RouteStat        `json:"routes,omitempty"`
-	Gateways           []*GatewayStat      `json:"gateways,omitempty"`
-	ActiveServers      int                 `json:"active_servers,omitempty"`
-	JetStream          *JetStreamVarz      `json:"jetstream,omitempty"`
-	MemLimit           int64               `json:"gomemlimit,omitempty"`
-	MaxProcs           int                 `json:"gomaxprocs,omitempty"`
+	Start                time.Time             `json:"start"`
+	Mem                  int64                 `json:"mem"`
+	Cores                int                   `json:"cores"`
+	CPU                  float64               `json:"cpu"`
+	Connections          int                   `json:"connections"`
+	TotalConnections     uint64                `json:"total_connections"`
+	ActiveAccounts       int                   `json:"active_accounts"`
+	NumSubs              uint32                `json:"subscriptions"`
+	Sent                 DataStats             `json:"sent"`
+	Received             DataStats             `json:"received"`
+	SlowConsumers        int64                 `json:"slow_consumers"`
+	SlowConsumersStats   *SlowConsumersStats   `json:"slow_consumer_stats,omitempty"`
+	StaleConnections     int64                 `json:"stale_connections,omitempty"`
+	StaleConnectionStats *StaleConnectionStats `json:"stale_connection_stats,omitempty"`
+	StalledClients       int64                 `json:"stalled_clients,omitempty"`
+	Routes               []*RouteStat          `json:"routes,omitempty"`
+	Gateways             []*GatewayStat        `json:"gateways,omitempty"`
+	ActiveServers        int                   `json:"active_servers,omitempty"`
+	JetStream            *JetStreamVarz        `json:"jetstream,omitempty"`
+	MemLimit             int64                 `json:"gomemlimit,omitempty"`
+	MaxProcs             int                   `json:"gomaxprocs,omitempty"`
 }
 
 // RouteStat holds route statistics.
@@ -420,7 +423,7 @@ type pubMsg struct {
 	sub  string
 	rply string
 	si   *ServerInfo
-	hdr  map[string]string
+	hdr  []byte
 	msg  any
 	oct  compressionType
 	echo bool
@@ -429,7 +432,7 @@ type pubMsg struct {
 
 var pubMsgPool sync.Pool
 
-func newPubMsg(c *client, sub, rply string, si *ServerInfo, hdr map[string]string,
+func newPubMsg(c *client, sub, rply string, si *ServerInfo, hdr []byte,
 	msg any, oct compressionType, echo, last bool) *pubMsg {
 
 	var m *pubMsg
@@ -604,17 +607,28 @@ RESET:
 				// Add in NL
 				b = append(b, _CRLF_...)
 
+				// Optional raw header addition.
+				if pm.hdr != nil {
+					b = append(pm.hdr, b...)
+					nhdr := len(pm.hdr)
+					nsize := len(b) - LEN_CR_LF
+					// MQTT producers don't have CRLF, so add it back.
+					if c.isMqtt() {
+						nsize += LEN_CR_LF
+					}
+					// Update pubArgs
+					// If others will use this later we need to save and restore original.
+					c.pa.hdr = nhdr
+					c.pa.size = nsize
+					c.pa.hdb = []byte(strconv.Itoa(nhdr))
+					c.pa.szb = []byte(strconv.Itoa(nsize))
+				}
+
 				// Check if we should set content-encoding
 				if contentHeader != _EMPTY_ {
 					b = c.setHeader(contentEncodingHeader, contentHeader, b)
 				}
 
-				// Optional header processing.
-				if pm.hdr != nil {
-					for k, v := range pm.hdr {
-						b = c.setHeader(k, v, b)
-					}
-				}
 				// Tracing
 				if trace {
 					c.traceInOp(fmt.Sprintf("PUB %s %s %d", c.pa.subject, c.pa.reply, c.pa.size), nil)
@@ -691,7 +705,7 @@ func (s *Server) sendInternalAccountMsg(a *Account, subject string, msg any) err
 }
 
 // Used to send an internal message with an optional reply to an arbitrary account.
-func (s *Server) sendInternalAccountMsgWithReply(a *Account, subject, reply string, hdr map[string]string, msg any, echo bool) error {
+func (s *Server) sendInternalAccountMsgWithReply(a *Account, subject, reply string, hdr []byte, msg any, echo bool) error {
 	s.mu.RLock()
 	if s.sys == nil || s.sys.sendq == nil {
 		s.mu.RUnlock()
@@ -943,6 +957,17 @@ func (s *Server) sendStatsz(subj string) {
 	}
 	if scs.Clients != 0 || scs.Routes != 0 || scs.Gateways != 0 || scs.Leafs != 0 {
 		m.Stats.SlowConsumersStats = scs
+	}
+	m.Stats.StaleConnections = atomic.LoadInt64(&s.staleConnections)
+	m.Stats.StalledClients = atomic.LoadInt64(&s.stalls)
+	stcs := &StaleConnectionStats{
+		Clients:  s.NumStaleConnectionsClients(),
+		Routes:   s.NumStaleConnectionsRoutes(),
+		Gateways: s.NumStaleConnectionsGateways(),
+		Leafs:    s.NumStaleConnectionsLeafs(),
+	}
+	if stcs.Clients != 0 || stcs.Routes != 0 || stcs.Gateways != 0 || stcs.Leafs != 0 {
+		m.Stats.StaleConnectionStats = stcs
 	}
 	m.Stats.NumSubs = s.numSubscriptions()
 	// Routes
@@ -1919,11 +1944,12 @@ func (s *Server) leafNodeConnected(sub *subscription, _ *client, _ *Account, sub
 
 // Common filter options for system requests STATSZ VARZ SUBSZ CONNZ ROUTEZ GATEWAYZ LEAFZ
 type EventFilterOptions struct {
-	Name    string   `json:"server_name,omitempty"` // filter by server name
-	Cluster string   `json:"cluster,omitempty"`     // filter by cluster name
-	Host    string   `json:"host,omitempty"`        // filter by host name
-	Tags    []string `json:"tags,omitempty"`        // filter by tags (must match all tags)
-	Domain  string   `json:"domain,omitempty"`      // filter by JS domain
+	Name       string   `json:"server_name,omitempty"` // filter by server name
+	Cluster    string   `json:"cluster,omitempty"`     // filter by cluster name
+	Host       string   `json:"host,omitempty"`        // filter by host name
+	ExactMatch bool     `json:"exact_match,omitempty"` // if the above filters should use exact matching or only "contains"
+	Tags       []string `json:"tags,omitempty"`        // filter by tags (must match all tags)
+	Domain     string   `json:"domain,omitempty"`      // filter by JS domain
 }
 
 // StatszEventOptions are options passed to Statsz
@@ -2022,18 +2048,21 @@ type RaftzEventOptions struct {
 }
 
 // returns true if the request does NOT apply to this server and can be ignored.
-// DO NOT hold the server lock when
+// DO NOT hold the server lock when calling this.
 func (s *Server) filterRequest(fOpts *EventFilterOptions) bool {
-	if fOpts.Name != _EMPTY_ && !strings.Contains(s.info.Name, fOpts.Name) {
-		return true
+	if fOpts == nil {
+		return false
 	}
-	if fOpts.Host != _EMPTY_ && !strings.Contains(s.info.Host, fOpts.Host) {
-		return true
-	}
-	if fOpts.Cluster != _EMPTY_ {
-		if !strings.Contains(s.ClusterName(), fOpts.Cluster) {
+	if fOpts.ExactMatch {
+		if (fOpts.Name != _EMPTY_ && fOpts.Name != s.info.Name) ||
+			(fOpts.Host != _EMPTY_ && fOpts.Host != s.info.Host) ||
+			(fOpts.Cluster != _EMPTY_ && fOpts.Cluster != s.ClusterName()) {
 			return true
 		}
+	} else if (fOpts.Name != _EMPTY_ && !strings.Contains(s.info.Name, fOpts.Name)) ||
+		(fOpts.Host != _EMPTY_ && !strings.Contains(s.info.Host, fOpts.Host)) ||
+		(fOpts.Cluster != _EMPTY_ && !strings.Contains(s.ClusterName(), fOpts.Cluster)) {
+		return true
 	}
 	if len(fOpts.Tags) > 0 {
 		opts := s.getOpts()
@@ -2599,7 +2628,7 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 }
 
 // This is the system level event sent to the system account for operators.
-func (s *Server) sendAuthErrorEvent(c *client) {
+func (s *Server) sendAuthErrorEvent(c *client, reason string) {
 	s.mu.Lock()
 	if !s.eventsEnabled() {
 		s.mu.Unlock()
@@ -2647,7 +2676,7 @@ func (s *Server) sendAuthErrorEvent(c *client) {
 				Bytes: c.outBytes,
 			},
 		},
-		Reason: AuthenticationViolation.String(),
+		Reason: reason,
 	}
 	c.mu.Unlock()
 
@@ -3055,7 +3084,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, _ *Account, subj
 	replySubj := s.newRespInbox()
 	// Store our handler.
 	s.sys.replies[replySubj] = func(sub *subscription, _ *client, _ *Account, subject, _ string, msg []byte) {
-		if n, err := strconv.Atoi(string(msg)); err == nil {
+		if n, err := strconv.ParseInt(string(msg), 10, 32); err == nil {
 			atomic.AddInt32(&nsubs, int32(n))
 		}
 		if atomic.AddInt32(&responses, 1) >= expected {

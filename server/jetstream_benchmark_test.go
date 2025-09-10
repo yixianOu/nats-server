@@ -858,12 +858,13 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 		replicas    int
 		messageSize int
 		numSubjects int
-		minMessages int
 	}{
-		{1, 1, 10, 1, 100_000}, // Single node, 10B messages, ~1MB minimum
-		{1, 1, 1024, 1, 1_000}, // Single node, 1KB messages, ~1MB minimum
-		{3, 3, 10, 1, 100_000}, // 3-nodes cluster, R=3, 10B messages, ~1MB minimum
-		{3, 3, 1024, 1, 1_000}, // 3-nodes cluster, R=3, 10B messages, ~1MB minimum
+		{1, 1, 10, 1},   // Single node, 10B messages
+		{1, 1, 1024, 1}, // Single node, 1KB messages
+		{3, 3, 10, 1},   // 3-nodes cluster, R=3, 10B messages
+		{3, 3, 1024, 1}, // 3-nodes cluster, R=3, 1KB messages
+		{3, 3, 10, 1},   // 3-nodes cluster, R=3, 10B messages (async flush)
+		{3, 3, 1024, 1}, // 3-nodes cluster, R=3, 1KB messages (async flush)
 	}
 
 	// All the cases above are run with each of the publisher cases below
@@ -885,7 +886,6 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 			bc.messageSize,
 			bc.numSubjects,
 		)
-
 		b.Run(
 			name,
 			func(b *testing.B) {
@@ -933,12 +933,13 @@ func BenchmarkJetStreamPublish(b *testing.B) {
 							if verbose {
 								b.Logf("Creating stream with R=%d and %d input subjects", bc.replicas, bc.numSubjects)
 							}
-							streamConfig := &nats.StreamConfig{
+							_, err = jsStreamCreate(b, nc, &StreamConfig{
 								Name:     streamName,
 								Subjects: subjects,
 								Replicas: bc.replicas,
-							}
-							if _, err := js.AddStream(streamConfig); err != nil {
+								Storage:  FileStorage,
+							})
+							if err != nil {
 								b.Fatalf("Error creating stream: %v", err)
 							}
 
@@ -1938,6 +1939,7 @@ func BenchmarkJetStreamPublishConcurrent(b *testing.B) {
 	}{
 		{1, 1},
 		{3, 3},
+		{3, 3},
 	}
 
 	workload := func(b *testing.B, numPubs int, messageSize int64, clientUrl string) {
@@ -2046,8 +2048,9 @@ func BenchmarkJetStreamPublishConcurrent(b *testing.B) {
 
 	// benchmark case matrix
 	for _, replicasCase := range replicasCases {
+		title := fmt.Sprintf("N=%d,R=%d", replicasCase.clusterSize, replicasCase.replicas)
 		b.Run(
-			fmt.Sprintf("N=%d,R=%d", replicasCase.clusterSize, replicasCase.replicas),
+			title,
 			func(b *testing.B) {
 				for _, messageSize := range messageSizeCases {
 					b.Run(
@@ -2065,10 +2068,11 @@ func BenchmarkJetStreamPublishConcurrent(b *testing.B) {
 										clientUrl := ls.ClientURL()
 
 										// create stream
-										_, err := js.AddStream(&nats.StreamConfig{
+										_, err := jsStreamCreate(b, nc, &StreamConfig{
 											Name:     streamName,
 											Subjects: []string{subject},
 											Replicas: replicasCase.replicas,
+											Storage:  FileStorage,
 										})
 										if err != nil {
 											b.Fatal(err)

@@ -4049,6 +4049,7 @@ func TestMonitorLeafz(t *testing.T) {
 			}
 		}
 		leafnodes {
+			isolate_leafnode_interest: true
 			remotes = [
 				{
 					account: "%s"
@@ -4144,6 +4145,9 @@ func TestMonitorLeafz(t *testing.T) {
 			}
 			if !ln.IsSpoke {
 				t.Fatal("Expected leafnode connection to be spoke")
+			}
+			if !ln.IsIsolated {
+				t.Fatal("Expected leafnode connection to be isolated")
 			}
 			if ln.RTT == "" {
 				t.Fatalf("RTT not tracked?")
@@ -5354,6 +5358,8 @@ func TestMonitorJsz(t *testing.T) {
 			if len(crgroup.RaftGroup) == 0 {
 				t.Fatal("expected consumer raft group info to be included")
 			}
+			require_True(t, si.Cluster.SystemAcc)
+			require_Equal(t, si.Cluster.TrafficAcc, "SYS")
 		}
 	})
 	t.Run("js-api-level", func(t *testing.T) {

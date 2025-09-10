@@ -371,6 +371,54 @@ func TestNRGSimpleElection(t *testing.T) {
 	}
 }
 
+// TestNRGLeaderTransfer verifies that a Raft group correctly transfers
+// leadership to a chosen preferred node when the current leader steps down.
+func TestNRGLeaderTransfer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, _ := jsClientConnect(t, c.leader(), nats.UserInfo("admin", "s3cr3t!"))
+	defer nc.Close()
+
+	rg := c.createMemRaftGroup("Test", 3, newStateAdder)
+	rg.waitOnLeader()
+
+	leader := rg.leader()
+	sub, err := nc.SubscribeSync(leader.node().(*raft).asubj)
+	require_NoError(t, err)
+
+	preferredID := rg.nonLeader().node().ID()
+	leader.node().StepDown(preferredID)
+	newLeader := rg.waitOnLeader()
+
+	require_Equal(t, newLeader.node().ID(), preferredID)
+
+	// Expect to see a EntryLeader message
+	checkFor(t, time.Second, 0, func() (err error) {
+		msg, err := sub.NextMsg(time.Second)
+		if err != nil {
+			return err
+		}
+
+		leader := newLeader.node().(*raft)
+		ae, err := leader.decodeAppendEntry(msg.Data, nil, msg.Reply)
+		if err != nil {
+			return err
+		}
+
+		if len(ae.entries) == 1 {
+			e := ae.entries[0]
+			if e.Type == EntryLeaderTransfer &&
+				string(e.Data) == preferredID {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("Expect EntryLeaderTransfer")
+	})
+	require_NoError(t, sub.Unsubscribe())
+}
+
 func TestNRGSwitchStateClearsQueues(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
@@ -380,6 +428,7 @@ func TestNRGSwitchStateClearsQueues(t *testing.T) {
 		prop:  newIPQueue[*proposedEntry](s, "prop"),
 		resp:  newIPQueue[*appendEntryResponse](s, "resp"),
 		leadc: make(chan bool, 1), // for switchState
+		sd:    t.TempDir(),
 	}
 	n.state.Store(int32(Leader))
 	require_Equal(t, n.prop.len(), 0)
@@ -874,6 +923,8 @@ func TestNRGNoResetOnAppendEntryResponse(t *testing.T) {
 	leader := rg.leader().node().(*raft)
 	follower := rg.nonLeader().node().(*raft)
 	lsm := rg.leader().(*stateAdder)
+	isLeader := require_ChanRead(t, lsm.lch, 5*time.Second)
+	require_True(t, isLeader)
 
 	// Subscribe for append entries that aren't heartbeats and respond to
 	// each of them as though it's a non-success and with a higher term.
@@ -887,10 +938,27 @@ func TestNRGNoResetOnAppendEntryResponse(t *testing.T) {
 	})
 	require_NoError(t, err)
 
-	// Generate an append entry that the subscriber above can respond to.
 	c.waitOnAllCurrent()
+
+	// Temporarily prevent followers to respond
+	locked := rg.lockFollowers()
+
+	// Generate an append entry that the subscriber above can respond to.
 	lsm.proposeDelta(5)
-	rg.waitOnTotal(t, 5)
+
+	// Expect the leader to step down
+	checkFor(t, 10*time.Second, 0, func() error {
+		isLeader = require_ChanRead(t, lsm.lch, 5*time.Second)
+		if isLeader {
+			return fmt.Errorf("Node is still leader!")
+		}
+		return nil
+	})
+
+	// Unlock the followers
+	for _, l := range locked {
+		l.node().(*raft).Unlock()
+	}
 
 	// The was-leader should now have stepped down, make sure that it
 	// didn't blow away its log in the process.
@@ -2347,6 +2415,7 @@ func TestNRGCatchupDontCountTowardQuorum(t *testing.T) {
 	sub, err := nc.SubscribeSync(aeReply)
 	require_NoError(t, err)
 	defer sub.Drain()
+	require_NoError(t, nc.Flush())
 
 	// Timeline
 	aeMissedMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: aeReply})
@@ -2496,7 +2565,6 @@ func TestNRGRejectAppendEntryDuringCatchupFromPreviousLeader(t *testing.T) {
 
 		// Now send the second catchup entry.
 		n.processAppendEntry(aeMsg2, nsub)
-		require_True(t, n.catchup == nil)
 		require_Equal(t, n.pterm, 1)
 
 		// Under the old behavior this entry is wrongly accepted.
@@ -2727,10 +2795,11 @@ func TestNRGSnapshotRecovery(t *testing.T) {
 	require_NoError(t, n.InstallSnapshot(nil))
 
 	// Restoring the snapshot should not up applied, because the apply queue is async.
-	n.pindex, n.commit, n.applied = 0, 0, 0
+	n.pindex, n.commit, n.processed, n.applied = 0, 0, 0, 0
 	n.setupLastSnapshot()
 	require_Equal(t, n.pindex, 1)
 	require_Equal(t, n.commit, 1)
+	require_Equal(t, n.processed, 0)
 	require_Equal(t, n.applied, 0)
 }
 
@@ -2812,6 +2881,7 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	sub, err := nc.SubscribeSync(voteReply)
 	require_NoError(t, err)
 	defer sub.Drain()
+	require_NoError(t, nc.Flush())
 
 	// Votes on a new leader, and resets notion of "empty vote" to ease getting quorum.
 	require_NoError(t, n.processVoteRequest(&voteRequest{term: 1, candidate: nats0, reply: voteReply}))
@@ -2881,6 +2951,564 @@ func TestNRGInitializeAndScaleUp(t *testing.T) {
 	vr = decodeVoteResponse(msg.Data)
 	require_True(t, vr.granted)
 	require_False(t, vr.empty)
+}
+
+func TestNRGReplayOnSnapshotSameTerm(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 2, entries: entries})
+
+	// Process the first append entry.
+	n.processAppendEntry(aeMsg1, n.aesub)
+	require_Equal(t, n.pindex, 1)
+
+	// Commit and apply.
+	require_NoError(t, n.applyCommit(1))
+	require_Equal(t, n.commit, 1)
+	n.Applied(1)
+	require_Equal(t, n.applied, 1)
+
+	// Install snapshot.
+	require_NoError(t, n.InstallSnapshot(nil))
+	snap, err := n.loadLastSnapshot()
+	require_NoError(t, err)
+	require_Equal(t, snap.lastIndex, 1)
+
+	// Process other messages.
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+
+	// Replay the append entry that matches our snapshot.
+	// This can happen as a repeated entry, or a delayed append entry after having already received it in a catchup.
+	// Should be recognized as a replay with the same term, marked as success, and not truncate.
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 3)
+}
+
+func TestNRGReplayOnSnapshotDifferentTerm(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 0, pindex: 0, entries: entries, lterm: 2})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 2, commit: 1, pterm: 1, pindex: 1, entries: entries, lterm: 2})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 2, commit: 1, pterm: 2, pindex: 2, entries: entries, lterm: 2})
+
+	// Process the first append entry.
+	n.processAppendEntry(aeMsg1, n.aesub)
+	require_Equal(t, n.pindex, 1)
+
+	// Commit and apply.
+	require_NoError(t, n.applyCommit(1))
+	require_Equal(t, n.commit, 1)
+	n.Applied(1)
+	require_Equal(t, n.applied, 1)
+
+	// Install snapshot.
+	require_NoError(t, n.InstallSnapshot(nil))
+	snap, err := n.loadLastSnapshot()
+	require_NoError(t, err)
+	require_Equal(t, snap.lastIndex, 1)
+
+	// Reset applied to simulate having received the snapshot from
+	// another leader, and we didn't apply yet since it's async.
+	n.applied = 0
+
+	// Process other messages.
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+
+	// Replay the append entry that matches our snapshot.
+	// This can happen as a repeated entry, or a delayed append entry after having already received it in a catchup.
+	// Should be recognized as truncating back to the installed snapshot, not reset the WAL fully.
+	// Since all is aligned after truncation, should also be able to apply the entry.
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+
+	// Should now also be able to apply the third entry.
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+}
+
+func TestNRGSizeAndApplied(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryNormal, esm)}})
+
+	var (
+		entries uint64
+		bytes   uint64
+	)
+
+	// Initially our WAL is empty.
+	entries, bytes = n.Size()
+	require_Equal(t, entries, 0)
+	require_Equal(t, bytes, 0)
+
+	// Store the first append entry.
+	require_NoError(t, n.storeToWAL(aeMsg1))
+	entries, bytes = n.Size()
+	require_Equal(t, entries, 1)
+	require_Equal(t, bytes, 105)
+
+	// Store the second append entry.
+	require_NoError(t, n.storeToWAL(aeMsg2))
+	entries, bytes = n.Size()
+	require_Equal(t, entries, 2)
+	require_Equal(t, bytes, 210)
+
+	// Applying should return what part of the WAL can be compacted.
+	n.commit = 1
+	entries, bytes = n.Applied(1)
+	require_Equal(t, entries, 1)
+	require_Equal(t, bytes, 105)
+
+	// After applying all should return our whole WAL can be compacted.
+	n.commit = 2
+	entries, bytes = n.Applied(2)
+	require_Equal(t, entries, 2)
+	require_Equal(t, bytes, 210)
+
+	// Installing a snapshot should properly correct n.papplied and n.bytes
+	n.applied = 1 // Reset just for testing.
+	require_NoError(t, n.InstallSnapshot(nil))
+	require_Equal(t, n.papplied, 1)
+	require_Equal(t, n.bytes, 105)
+	entries, bytes = n.Size()
+	require_Equal(t, entries, 1)
+	require_Equal(t, bytes, 105)
+
+	entries, bytes = n.Applied(2)
+	require_Equal(t, entries, 1)
+	require_Equal(t, bytes, 105)
+
+	require_NoError(t, n.InstallSnapshot(nil))
+	require_Equal(t, n.papplied, 2)
+	require_Equal(t, n.bytes, 0)
+	entries, bytes = n.Size()
+	require_Equal(t, entries, 0)
+	require_Equal(t, bytes, 0)
+}
+
+func TestNRGIgnoreEntryAfterCanceledCatchup(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_True(t, n.catchup != nil)
+
+	csub := n.catchup.sub
+	n.cancelCatchup()
+
+	// Catchup was canceled, a message on this canceled catchup should not be stored.
+	n.processAppendEntry(aeMsg1, csub)
+	require_Equal(t, n.pindex, 0)
+}
+
+func TestNRGDelayedMessagesAfterCatchupDontCountTowardQuorum(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	aeReply := "$TEST"
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: aeReply})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: entries, reply: aeReply})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 2, entries: entries, reply: aeReply})
+
+	// Triggers catchup.
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_True(t, n.catchup != nil)
+
+	// Catchup runs partially.
+	n.processAppendEntry(aeMsg1, n.catchup.sub)
+	n.processAppendEntry(aeMsg2, n.catchup.sub)
+	require_Equal(t, n.pindex, 2)
+	require_Equal(t, n.commit, 1)
+	n.Applied(1)
+	require_Equal(t, n.applied, 1)
+	require_NoError(t, n.InstallSnapshot(nil))
+
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// We now receive delayed "real-time" messages.
+	// The first message needs to be a copy, because we've committed it before and returned it to the pool.
+	aeMsg1Copy := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: aeReply})
+	n.processAppendEntry(aeMsg1Copy, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	// Should NOT reply "success", otherwise we would wrongfully provide quorum while not having an up-to-date log.
+	_, err = sub.NextMsg(500 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+	// Should NOT reply "success", otherwise we would wrongfully provide quorum while not having an up-to-date log.
+	_, err = sub.NextMsg(500 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+	// Should reply "success", this is the latest message.
+	msg, err := sub.NextMsg(500 * time.Millisecond)
+	require_NoError(t, err)
+	ar := n.decodeAppendEntryResponse(msg.Data)
+	require_Equal(t, ar.index, 3)
+	require_True(t, ar.success)
+	require_Equal(t, msg.Reply, _EMPTY_)
+}
+
+func TestNRGStepdownWithHighestTermDuringCatchup(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, lterm: 10, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, lterm: 20, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+
+	// Need to store the message, stepdown, and up term.
+	n.switchToCandidate()
+	require_Equal(t, n.term, 1)
+	n.processAppendEntry(aeMsg1, n.aesub)
+	require_Equal(t, n.term, 10)
+	require_Equal(t, n.pindex, 1)
+
+	// Need to store the message, stepdown, and up term.
+	n.switchToLeader()
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.term, 20)
+	require_Equal(t, n.pindex, 2)
+}
+
+func TestNRGTruncateOnStartup(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	s := c.servers[0] // RunBasicJetStreamServer not available
+	defer c.shutdown()
+
+	storeDir := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: storeDir, BlockSize: defaultMediumBlockSize, AsyncFlush: false, srv: s}
+	scfg := StreamConfig{Name: "RAFT", Storage: FileStorage}
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+
+	cfg := &RaftConfig{Name: "TEST", Store: storeDir, Log: fs}
+
+	err = s.bootstrapRaftNode(cfg, nil, false)
+	require_NoError(t, err)
+	n, err := s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+
+	// Store two messages the normal way.
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	require_Equal(t, n.pindex, 2)
+
+	state := n.wal.State()
+	require_Equal(t, state.Msgs, 2)
+	require_Equal(t, state.FirstSeq, 1)
+	require_Equal(t, state.LastSeq, 2)
+	require_Equal(t, state.NumDeleted, 0)
+
+	// Simulate a truncation that's only performed halfway, and we got hard killed at some point.
+	removed, err := n.wal.RemoveMsg(2)
+	require_True(t, removed)
+	require_NoError(t, err)
+
+	state = n.wal.State()
+	require_Equal(t, state.Msgs, 1)
+	require_Equal(t, state.FirstSeq, 1)
+	require_Equal(t, state.LastSeq, 2)
+	require_Equal(t, state.NumDeleted, 1)
+
+	// Restart.
+	n.Stop()
+	n.WaitForStop()
+	require_NoError(t, fs.Stop())
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	cfg = &RaftConfig{Name: "TEST", Store: storeDir, Log: fs}
+	n, err = s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	// Should truncate the WAL on startup, the message was removed.
+	state = n.wal.State()
+	require_Equal(t, state.Msgs, 1)
+	require_Equal(t, state.FirstSeq, 1)
+	require_Equal(t, state.LastSeq, 1)
+	require_Equal(t, state.NumDeleted, 0)
+
+	// Store an invalid append entry manually.
+	aeMsg2.pindex = 0
+	aeMsg2 = encode(t, aeMsg2)
+	_, _, err = n.wal.StoreMsg(_EMPTY_, nil, aeMsg2.buf, 0)
+	require_NoError(t, err)
+
+	state = n.wal.State()
+	require_Equal(t, state.Msgs, 2)
+	require_Equal(t, state.FirstSeq, 1)
+	require_Equal(t, state.LastSeq, 2)
+	require_Equal(t, state.NumDeleted, 0)
+
+	// Restart.
+	n.Stop()
+	n.WaitForStop()
+	require_NoError(t, fs.Stop())
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	cfg = &RaftConfig{Name: "TEST", Store: storeDir, Log: fs}
+	n, err = s.initRaftNode(globalAccountName, cfg, pprofLabels{})
+	require_NoError(t, err)
+
+	// Should truncate the WAL on startup, the append entry is invalid.
+	state = n.wal.State()
+	require_Equal(t, state.Msgs, 1)
+	require_Equal(t, state.FirstSeq, 1)
+	require_Equal(t, state.LastSeq, 1)
+	require_Equal(t, state.NumDeleted, 0)
+}
+
+func TestNRGLeaderCatchupHandling(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 2, entries: entries})
+
+	n.processAppendEntry(aeMsg1, n.aesub)
+	n.processAppendEntry(aeMsg2, n.aesub)
+	n.processAppendEntry(aeMsg3, n.aesub)
+	require_Equal(t, n.pindex, 3)
+
+	n.switchToLeader()
+
+	catchupReply := "$TEST"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(catchupReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// Simulate a follower that's up-to-date with only the first message.
+	n.catchupFollower(&appendEntryResponse{success: false, term: 1, index: 1, reply: catchupReply})
+
+	// Should receive all messages the leader knows up to this point.
+	msg, err := sub.NextMsg(500 * time.Millisecond)
+	require_NoError(t, err)
+	ae, err := n.decodeAppendEntry(msg.Data, nil, _EMPTY_)
+	require_NoError(t, err)
+	require_Equal(t, ae.pterm, 1)
+	require_Equal(t, ae.pindex, 1)
+
+	msg, err = sub.NextMsg(500 * time.Millisecond)
+	require_NoError(t, err)
+	ae, err = n.decodeAppendEntry(msg.Data, nil, _EMPTY_)
+	require_NoError(t, err)
+	require_Equal(t, ae.pterm, 1)
+	require_Equal(t, ae.pindex, 2)
+}
+
+func TestNRGNewEntriesFromOldLeaderResetsWALDuringCatchup(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, lterm: 20, term: 20, commit: 0, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, lterm: 20, term: 20, commit: 0, pterm: 20, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, lterm: 20, term: 20, commit: 0, pterm: 20, pindex: 2, entries: entries})
+
+	aeReply := "$TEST"
+	aeMsg1Fork := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: aeReply})
+	aeMsg2Fork := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 1, pindex: 1, entries: entries})
+
+	// Trigger a catchup.
+	n.processAppendEntry(aeMsg2, n.aesub)
+	validateCatchup := func() {
+		t.Helper()
+		require_True(t, n.catchup != nil)
+		require_Equal(t, n.catchup.cterm, 20)
+		require_Equal(t, n.catchup.cindex, 1)
+	}
+	validateCatchup()
+
+	// Catchup the first missed entry.
+	csub := n.catchup.sub
+	n.processAppendEntry(aeMsg1, csub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.pterm, 20)
+
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+	require_NoError(t, nc.Flush())
+
+	// Would previously stall the catchup and restart it with a previous leader.
+	n.catchup.pindex = aeMsg1.pindex + 1
+	n.catchup.active = time.Time{}
+	n.processAppendEntry(aeMsg1Fork, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.pterm, 20)
+	validateCatchup()
+
+	// Should reply we have a higher term, prompting the server to step down.
+	msg, err := sub.NextMsg(time.Second)
+	require_NoError(t, err)
+	ar := n.decodeAppendEntryResponse(msg.Data)
+	require_False(t, ar.success)
+	require_Equal(t, ar.index, 1)
+	require_Equal(t, ar.term, 20)
+
+	// Would previously reset the WAL.
+	n.processAppendEntry(aeMsg2Fork, n.aesub)
+	require_Equal(t, n.pindex, 1)
+	require_Equal(t, n.pterm, 20)
+	validateCatchup()
+
+	// Now the catchup should continue, undisturbed by an old leader sending append entries.
+	n.processAppendEntry(aeMsg2, csub)
+	require_Equal(t, n.pindex, 2)
+	require_Equal(t, n.pterm, 20)
+	require_True(t, n.catchup == nil)
+
+	// A remaining catchup entry can still be ingested, even if the catchup state itself is gone.
+	n.processAppendEntry(aeMsg3, csub)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.pterm, 20)
+}
+
+func TestNRGProcessed(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	// Timeline
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 0, pindex: 0, entries: entries})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 2, pterm: 1, pindex: 1, entries: entries})
+	aeMsg3 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 3, pterm: 1, pindex: 2, entries: entries})
+	aeMsg4 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 4, pterm: 1, pindex: 3, entries: entries})
+	aeMsg5 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 5, pterm: 1, pindex: 4, entries: entries})
+
+	// Store three entries.
+	for i, aeMsg := range []*appendEntry{aeMsg1, aeMsg2, aeMsg3} {
+		n.processAppendEntry(aeMsg, n.aesub)
+		require_Equal(t, n.pindex, uint64(i+1))
+		require_Equal(t, n.commit, uint64(i+1))
+		require_Equal(t, n.processed, 0)
+		require_Equal(t, n.applied, 0)
+	}
+
+	// n.Processed can move both n.processed and n.applied up, with different values.
+	n.Processed(1, 0)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 3)
+	require_Equal(t, n.processed, 1)
+	require_Equal(t, n.applied, 0)
+
+	n.Processed(2, 1)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 3)
+	require_Equal(t, n.processed, 2)
+	require_Equal(t, n.applied, 1)
+
+	// n.Applied moves both n.processed and n.applied up to the same value.
+	n.Applied(3)
+	require_Equal(t, n.pindex, 3)
+	require_Equal(t, n.commit, 3)
+	require_Equal(t, n.processed, 3)
+	require_Equal(t, n.applied, 3)
+
+	// Store the remaining messages.
+	for i, aeMsg := range []*appendEntry{aeMsg4, aeMsg5} {
+		n.processAppendEntry(aeMsg, n.aesub)
+		require_Equal(t, n.pindex, uint64(i+4))
+		require_Equal(t, n.commit, uint64(i+4))
+		require_Equal(t, n.processed, 3)
+		require_Equal(t, n.applied, 3)
+	}
+
+	// An invalid processed call with a higher applied should be clamped back down to the processed index.
+	n.Processed(4, 5)
+	require_Equal(t, n.pindex, 5)
+	require_Equal(t, n.commit, 5)
+	require_Equal(t, n.processed, 4)
+	require_Equal(t, n.applied, 4)
 }
 
 // This is a RaftChainOfBlocks test where a block is proposed and then we wait for all replicas to apply it before

@@ -1594,19 +1594,17 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	// Now create the max connections.
 	// We create half then we will wait and then create the rest.
 	// Will test that we disconnect the newest ones.
-	newConns := make([]*nats.Conn, 0, 5)
 	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
 	for i := 0; i < 5; i++ {
-		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.Name("OLD"), nats.NoReconnect(), createUserCreds(t, s, akp))
 		require_NoError(t, err)
 		defer nc.Close()
 	}
 	time.Sleep(500 * time.Millisecond)
 	for i := 0; i < 5; i++ {
-		nc, err := nats.Connect(url, nats.NoReconnect(), createUserCreds(t, s, akp))
+		nc, err := nats.Connect(url, nats.Name("NEW"), nats.NoReconnect(), createUserCreds(t, s, akp))
 		require_NoError(t, err)
 		defer nc.Close()
-		newConns = append(newConns, nc)
 	}
 
 	// We should have max here.
@@ -1624,15 +1622,12 @@ func TestAccountConnsLimitExceededAfterUpdateDisconnectNewOnly(t *testing.T) {
 	// We should have closed the excess connections.
 	checkClientsCount(t, s, acc.MaxActiveConnections())
 
-	// Now make sure that only the new ones were closed.
-	var closed int
-	for _, nc := range newConns {
-		if !nc.IsClosed() {
-			closed++
-		}
-	}
-	if closed != 5 {
-		t.Fatalf("Expected all new clients to be closed, only got %d of 5", closed)
+	connz, err := s.Connz(nil)
+	require_NoError(t, err)
+
+	// There should only be OLD connections.
+	for _, c := range connz.Conns {
+		require_Equal(t, c.Name, "OLD")
 	}
 }
 
@@ -1956,6 +1951,8 @@ func TestServerEventsStatsZ(t *testing.T) {
 			t.Fatalf("Expected server A's route to B to have Name set to %q, got %q", "B", sr.Name)
 		}
 	}
+	// Increment stalls to confirm they are reported.
+	atomic.AddInt64(&sb.stalls, 3)
 
 	// Now query B and check that route's name is "A"
 	subj = fmt.Sprintf(serverStatsReqSubj, sb.ID())
@@ -1976,6 +1973,7 @@ func TestServerEventsStatsZ(t *testing.T) {
 			t.Fatalf("Expected server B's route to A to have Name set to %q, got %q", "A_SRV", sr.Name)
 		}
 	}
+	require_Equal(t, m.Stats.StalledClients, 3)
 }
 
 func TestServerEventsHealthZSingleServer(t *testing.T) {
@@ -3353,6 +3351,86 @@ func TestServerEventsFilteredByTag(t *testing.T) {
 	require_Len(t, len(msgs), 0)
 }
 
+func TestServerUnstableEventFilterMatch(t *testing.T) {
+	confA := createConfFile(t, []byte(`
+		listen: -1
+		server_name: srv1
+		server_tags: ["foo", "bar"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `))
+	sA, _ := RunServerWithConfig(confA)
+	defer sA.Shutdown()
+	confB := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: -1
+		server_name: srv10
+		server_tags: ["bar", "baz"]
+		cluster {
+			name: clust
+			listen: -1
+			no_advertise: true
+			routes [
+				nats-route://127.0.0.1:%d
+			]
+		}
+		system_account: SYS
+		accounts: {
+			SYS: {
+				users: [
+					{user: b, password: b}
+				]
+			}
+		}
+		no_auth_user: b
+    `, sA.opts.Cluster.Port)))
+	sB, _ := RunServerWithConfig(confB)
+	defer sB.Shutdown()
+	checkClusterFormed(t, sA, sB)
+
+	tester := func(t *testing.T, nc *nats.Conn, name string, count int) {
+		t.Helper()
+
+		r, err := json.Marshal(VarzEventOptions{EventFilterOptions: EventFilterOptions{Name: name, ExactMatch: true}})
+		require_NoError(t, err)
+
+		for i := 0; i < count; i++ {
+			res, err := nc.Request(fmt.Sprintf(serverPingReqSubj, "VARZ"), r, time.Second)
+			require_NoError(t, err)
+
+			var vz ServerAPIVarzResponse
+			err = json.Unmarshal(res.Data, &vz)
+			require_NoError(t, err)
+
+			if vz.Server.Name != name {
+				t.Fatalf("Expected server name to be %q, got %q", name, vz.Server.Name)
+			}
+		}
+	}
+
+	// Connects to srv1 so it's most likely to respond first while we are asking srv10 to respond.
+	nc := natsConnect(t, sA.ClientURL())
+	defer nc.Close()
+	tester(t, nc, "srv10", 10)
+
+	// Connects to srv10 so it's most likely to respond first while we are asking srv1 to respond.
+	nc.Close()
+	nc = natsConnect(t, sB.ClientURL())
+	defer nc.Close()
+	tester(t, nc, "srv1", 10)
+}
+
 // https://github.com/nats-io/nats-server/issues/3177
 func TestServerEventsAndDQSubscribers(t *testing.T) {
 	c := createJetStreamClusterWithTemplate(t, jsClusterAccountsTempl, "DDQ", 3)
@@ -3769,6 +3847,93 @@ func TestServerEventsPingStatsSlowConsumersStats(t *testing.T) {
 	}
 }
 
+func TestServerEventsPingStatsStaleConnectionStats(t *testing.T) {
+	templ := `
+                        listen: "127.0.0.1:-1"
+                        system_account = sys
+                        accounts {
+                          a {
+                            users = [{ user: a,  pass: a  }]
+                          }
+                          b {
+                            users = [{ user: b,  pass: b  }]
+                          }
+                          sys {
+                            users = [{ user: sys, pass: sys }]
+                          }
+                        }
+                        `
+	conf := createConfFile(t, []byte(templ))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	// 3 different ways to get statz:
+	const statsz = "STATSZ"
+
+	// $SYS.REQ.SERVER.NCBT6MBA7Q7ZF4R4WVXTSZTCZDPPXX2ALLN3XM75VCBCNMPIKQFPFLKV.STATSZ
+	dirReqSubject := func(s *Server) string {
+		return fmt.Sprintf(serverDirectReqSubj, s.ID(), statsz)
+	}
+	// $SYS.REQ.SERVER.PING.STATSZ
+	pingReqSubject := func(s *Server) string {
+		return fmt.Sprintf(serverPingReqSubj, statsz)
+	}
+	// $SYS.REQ.SERVER.PING
+	statsPingSubject := func(s *Server) string {
+		return serverStatsPingReqSubj
+	}
+	subjects := []string{dirReqSubject(s), pingReqSubject(s), statsPingSubject(s)}
+
+	ncs, err := nats.Connect(s.ClientURL(), nats.UserInfo("sys", "sys"))
+	require_NoError(t, err)
+
+	for _, subject := range subjects {
+		msg, err := ncs.Request(subject, nil, time.Second)
+		require_NoError(t, err)
+
+		var ssm ServerStatsMsg
+		err = json.Unmarshal(msg.Data, &ssm)
+		require_NoError(t, err)
+
+		// No stale connection stats.
+		require_True(t, ssm.Stats.StaleConnectionStats == nil)
+		require_Equal(t, s.NumStaleConnections(), int64(0))
+		require_Equal(t, s.NumStaleConnectionsClients(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsRoutes(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsGateways(), uint64(0))
+		require_Equal(t, s.NumStaleConnectionsLeafs(), uint64(0))
+	}
+
+	// Set some values and confirm.
+	s.staleStats.clients.Store(1)
+	s.staleStats.routes.Store(2)
+	s.staleStats.gateways.Store(3)
+	s.staleStats.leafs.Store(4)
+	atomic.StoreInt64(&s.staleConnections, 10)
+	require_Equal(t, s.NumStaleConnections(), int64(10))
+	require_Equal(t, s.NumStaleConnectionsClients(), uint64(1))
+	require_Equal(t, s.NumStaleConnectionsRoutes(), uint64(2))
+	require_Equal(t, s.NumStaleConnectionsGateways(), uint64(3))
+	require_Equal(t, s.NumStaleConnectionsLeafs(), uint64(4))
+
+	for _, subject := range subjects {
+		msg, err := ncs.Request(subject, nil, time.Second)
+		require_NoError(t, err)
+
+		ssm := ServerStatsMsg{}
+		err = json.Unmarshal(msg.Data, &ssm)
+		require_NoError(t, err)
+
+		require_NotNil(t, ssm.Stats.StaleConnectionStats)
+		stcs := ssm.Stats.StaleConnectionStats
+		require_Equal(t, stcs.Clients, 1)
+		require_Equal(t, stcs.Routes, 2)
+		require_Equal(t, stcs.Gateways, 3)
+		require_Equal(t, stcs.Leafs, 4)
+		require_Equal(t, ssm.Stats.StaleConnections, int64(10))
+	}
+}
+
 func TestServerEventsStatszMaxProcsMemLimit(t *testing.T) {
 	// We want to prove that our set values are reflected in STATSZ,
 	// so we can't use constants that might match the system that
@@ -3887,10 +4052,13 @@ func TestServerEventsConnectDisconnectForGlobalAcc(t *testing.T) {
 	require_NoError(t, err)
 	defer ncs.Close()
 
-	s1, err := ncs.SubscribeSync(fmt.Sprintf(connectEventSubj, "*"))
+	s1, err := ncs.SubscribeSync(fmt.Sprintf(connectEventSubj, globalAccountName))
 	require_NoError(t, err)
-	s2, err := ncs.SubscribeSync(fmt.Sprintf(disconnectEventSubj, "*"))
+	s2, err := ncs.SubscribeSync(fmt.Sprintf(disconnectEventSubj, globalAccountName))
 	require_NoError(t, err)
+
+	// Flush to make sure subscriptions are established
+	require_NoError(t, ncs.Flush())
 
 	// Connect to global account
 	ncg, err := nats.Connect(url, nats.UserInfo("", ""))

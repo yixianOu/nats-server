@@ -154,6 +154,7 @@ const (
 	compressionNegotiated                         // Marks if this connection has negotiated compression level with remote.
 	didTLSFirst                                   // Marks if this connection requested and was accepted doing the TLS handshake first (prior to INFO).
 	isSlowConsumer                                // Marks connection as a slow consumer.
+	firstPong                                     // Marks if this is the first PONG received
 )
 
 // set the flag (would be equivalent to set the boolean to true)
@@ -223,6 +224,8 @@ const (
 	MinimumVersionRequired
 	ClusterNamesIdentical
 	Kicked
+	ProxyNotTrusted
+	ProxyRequired
 )
 
 // Some flags passed to processMsgResults
@@ -256,6 +259,8 @@ type client struct {
 	pubKey     string
 	nc         net.Conn
 	ncs        atomic.Value
+	ncsAcc     atomic.Value
+	ncsUser    atomic.Value
 	out        outbound
 	user       *NkeyUser
 	host       string
@@ -271,6 +276,7 @@ type client struct {
 	msgb       [msgScratchSize]byte
 	last       time.Time
 	lastIn     time.Time
+	proxyKey   string
 
 	repliesSincePrune uint16
 	lastReplyPrune    time.Time
@@ -299,6 +305,13 @@ type client struct {
 	nameTag string
 
 	tlsTo *time.Timer
+
+	// Authentication error override. This is used because the authentication
+	// stack is simply returning a boolean, and the only authentication error
+	// reported is the generic `ErrAuthentication`. In the authentication code,
+	// if we want to report a different error, we can now set this field
+	// and `authViolation()` will use that one.
+	authErr error
 }
 
 type rrTracking struct {
@@ -653,6 +666,9 @@ type ClientOpts struct {
 
 	// Leafnodes
 	RemoteAccount string `json:"remote_account,omitempty"`
+
+	// Proxy would include its own nonce signature.
+	ProxySig string `json:"proxy_sig,omitempty"`
 }
 
 var defaultOpts = ClientOpts{Verbose: true, Pedantic: true, Echo: true}
@@ -706,7 +722,7 @@ func (c *client) initClient() {
 		if addr := c.nc.RemoteAddr(); addr != nil {
 			if conn = addr.String(); conn != _EMPTY_ {
 				host, port, _ := net.SplitHostPort(conn)
-				iPort, _ := strconv.Atoi(port)
+				iPort, _ := strconv.ParseUint(port, 10, 16)
 				c.host, c.port = host, uint16(iPort)
 				if c.isWebsocket() && c.ws.clientIP != _EMPTY_ {
 					cip := c.ws.clientIP
@@ -1855,6 +1871,19 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 	case ReadError, WriteError, SlowConsumerPendingBytes, SlowConsumerWriteDeadline, TLSHandshakeError:
 		c.flags.set(skipFlushOnClose)
 		skipFlush = true
+	case StaleConnection:
+		// Track stale connections statistics.
+		atomic.AddInt64(&c.srv.staleConnections, 1)
+		switch c.kind {
+		case CLIENT:
+			c.srv.staleStats.clients.Add(1)
+		case ROUTER:
+			c.srv.staleStats.routes.Add(1)
+		case GATEWAY:
+			c.srv.staleStats.gateways.Add(1)
+		case LEAF:
+			c.srv.staleStats.leafs.Add(1)
+		}
 	}
 	if c.flags.isSet(connMarkedClosed) {
 		return
@@ -1881,9 +1910,6 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 			}
 			if remoteName != _EMPTY_ {
 				tags = append(tags, fmt.Sprintf("Remote: %s", remoteName))
-			}
-			if c.acc != nil {
-				tags = append(tags, fmt.Sprintf("Account: %s", c.acc.traceLabel()))
 			}
 			if len(tags) > 0 {
 				c.Noticef("%s connection closed: %s - %s", c.kindString(), reason, strings.Join(tags, ", "))
@@ -1932,7 +1958,7 @@ func (c *client) flushSignal() {
 
 // Traces a message.
 // Will NOT check if tracing is enabled, does NOT need the client lock.
-func (c *client) traceMsg(msg []byte) {
+func (c *client) traceMsgInternal(msg []byte, delivered bool, hdrSize int) {
 	opts := c.srv.getOpts()
 	maxTrace := opts.MaxTracedMsgLen
 	headersOnly := opts.TraceHeaders
@@ -1941,8 +1967,13 @@ func (c *client) traceMsg(msg []byte) {
 	// If TraceHeaders is enabled, extract only the header portion of the msg.
 	// If a header is present, it ends with an additional trailing CRLF.
 	if headersOnly {
-		msg, _ = c.msgParts(msg)
-		suffix += LEN_CR_LF
+		if hdrSize > 0 && len(msg) >= hdrSize {
+			msg = msg[:hdrSize]
+			suffix += LEN_CR_LF
+		} else {
+			// No headers present, so nothing to trace.
+			return
+		}
 	}
 
 	// Do not emit a log line for zero-length payloads.
@@ -1951,12 +1982,30 @@ func (c *client) traceMsg(msg []byte) {
 		return
 	}
 
+	const (
+		traceInPrefix  string = "<<-"
+		traceOutPrefix string = "->>"
+	)
+	var prefix string
+	if delivered {
+		prefix = traceOutPrefix
+	} else {
+		prefix = traceInPrefix
+	}
 	if maxTrace > 0 && l > maxTrace {
 		tm := fmt.Sprintf("%q", msg[:maxTrace])
-		c.Tracef("<<- MSG_PAYLOAD: [\"%s...\"]", tm[1:len(tm)-1])
+		c.Tracef("%s MSG_PAYLOAD: [\"%s...\"]", prefix, tm[1:len(tm)-1])
 	} else {
-		c.Tracef("<<- MSG_PAYLOAD: [%q]", msg[:l])
+		c.Tracef("%s MSG_PAYLOAD: [%q]", prefix, msg[:l])
 	}
+}
+
+func (c *client) traceMsg(msg []byte) {
+	c.traceMsgInternal(msg, false, c.pa.hdr)
+}
+
+func (c *client) traceMsgDelivery(msg []byte, hdrSize int) {
+	c.traceMsgInternal(msg, true, hdrSize)
 }
 
 // Traces an incoming operation.
@@ -2109,6 +2158,7 @@ func (c *client) processConnect(arg []byte) error {
 	}
 	// Indicate that the CONNECT protocol has been received, and that the
 	// server now knows which protocol this client supports.
+	firstConnect := !c.flags.isSet(connectReceived)
 	c.flags.set(connectReceived)
 	// Capture these under lock
 	c.echo = c.opts.Echo
@@ -2117,30 +2167,6 @@ func (c *client) processConnect(arg []byte) error {
 	lang := c.opts.Lang
 	account := c.opts.Account
 	accountNew := c.opts.AccountNew
-
-	if c.kind == CLIENT {
-		var ncs string
-		if c.opts.Version != _EMPTY_ {
-			ncs = fmt.Sprintf("v%s", c.opts.Version)
-		}
-		if c.opts.Lang != _EMPTY_ {
-			if c.opts.Version == _EMPTY_ {
-				ncs = c.opts.Lang
-			} else {
-				ncs = fmt.Sprintf("%s:%s", ncs, c.opts.Lang)
-			}
-		}
-		if c.opts.Name != _EMPTY_ {
-			if c.opts.Version == _EMPTY_ && c.opts.Lang == _EMPTY_ {
-				ncs = c.opts.Name
-			} else {
-				ncs = fmt.Sprintf("%s:%s", ncs, c.opts.Name)
-			}
-		}
-		if ncs != _EMPTY_ {
-			c.ncs.CompareAndSwap(nil, fmt.Sprintf("%s - %q", c, ncs))
-		}
-	}
 
 	// if websocket client, maybe some options through cookies
 	if ws := c.ws; ws != nil {
@@ -2215,6 +2241,55 @@ func (c *client) processConnect(arg []byte) error {
 			// By default register with the global account.
 			c.registerWithAccount(srv.globalAccount())
 		}
+
+		// Initialize user info used in logs.
+		c.mu.Lock()
+		acc := c.acc
+		if c.getRawAuthUser() != _EMPTY_ {
+			c.ncsUser.Store(c.getAuthUserLabel())
+		}
+		c.mu.Unlock()
+		if acc != nil {
+			acc.mu.RLock()
+			c.ncsAcc.Store(acc.traceLabel())
+			acc.mu.RUnlock()
+		}
+
+		// Enable logging connection details and auth info for this client.
+		if c.kind == CLIENT && firstConnect && c.srv != nil {
+			var ncs string
+			if c.opts.Version != _EMPTY_ {
+				ncs = fmt.Sprintf("v%s", c.opts.Version)
+			}
+			if c.opts.Lang != _EMPTY_ {
+				if c.opts.Version == _EMPTY_ {
+					ncs = c.opts.Lang
+				} else {
+					ncs = fmt.Sprintf("%s:%s", ncs, c.opts.Lang)
+				}
+			}
+			if c.opts.Name != _EMPTY_ {
+				if c.opts.Version == _EMPTY_ && c.opts.Lang == _EMPTY_ {
+					ncs = c.opts.Name
+				} else {
+					ncs = fmt.Sprintf("%s:%s", ncs, c.opts.Name)
+				}
+			}
+			var acs string
+			accl := c.ncsAcc.Load()
+			authUser := c.ncsUser.Load()
+			if accl != nil && authUser != nil {
+				acs = fmt.Sprintf("%s/%s", accl, authUser)
+			}
+			switch {
+			case ncs != _EMPTY_ && acs != _EMPTY_:
+				c.ncs.Store(fmt.Sprintf("%s - %q - %q", c, ncs, acs))
+			case ncs != _EMPTY_:
+				c.ncs.Store(fmt.Sprintf("%s - %q", c, ncs))
+			case acs != _EMPTY_:
+				c.ncs.Store(fmt.Sprintf("%s - %q", c, acs))
+			}
+		}
 	}
 
 	switch kind {
@@ -2253,12 +2328,12 @@ func (c *client) processConnect(arg []byte) error {
 
 func (c *client) sendErrAndErr(err string) {
 	c.sendErr(err)
-	c.Errorf(err)
+	c.RateLimitErrorf(err)
 }
 
 func (c *client) sendErrAndDebug(err string) {
 	c.sendErr(err)
-	c.Debugf(err)
+	c.RateLimitDebugf(err)
 }
 
 func (c *client) authTimeout() {
@@ -2277,38 +2352,28 @@ func (c *client) accountAuthExpired() {
 }
 
 func (c *client) authViolation() {
-	var s *Server
-	var hasTrustedNkeys, hasNkeys, hasUsers bool
-	if s = c.srv; s != nil {
-		s.mu.RLock()
-		hasTrustedNkeys = s.trustedKeys != nil
-		hasNkeys = s.nkeys != nil
-		hasUsers = s.users != nil
-		s.mu.RUnlock()
-		defer s.sendAuthErrorEvent(c)
+	authErr := c.getAuthError()
+	if authErr == nil {
+		authErr = ErrAuthentication
 	}
+	reason := getAuthErrClosedState(authErr)
 
-	if hasTrustedNkeys {
-		c.Errorf("%v", ErrAuthentication)
-	} else if hasNkeys {
-		c.Errorf("%s - Nkey %q",
-			ErrAuthentication.Error(),
-			c.opts.Nkey)
-	} else if hasUsers {
-		c.Errorf("%s - User %q",
-			ErrAuthentication.Error(),
-			c.opts.Username)
-	} else {
-		if c.srv != nil {
+	var s *Server
+	if s = c.srv; s != nil {
+		defer s.sendAuthErrorEvent(c, reason.String())
+		if c.getRawAuthUser() != _EMPTY_ {
+			c.Errorf("%v - %s", ErrAuthentication, c.getAuthUser())
+		} else {
 			c.Errorf(ErrAuthentication.Error())
 		}
 	}
 	if c.isMqtt() {
 		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false)
 	} else {
+		// Send this to client, regardless of the authErr override.
 		c.sendErr("Authorization Violation")
 	}
-	c.closeConnection(AuthenticationViolation)
+	c.closeConnection(reason)
 }
 
 func (c *client) maxAccountConnExceeded() {
@@ -2572,6 +2637,14 @@ func (c *client) processPong() {
 	c.rtt = computeRTT(c.rttStart)
 	srv := c.srv
 	reorderGWs := c.kind == GATEWAY && c.gw.outbound
+	firstPong := c.flags.setIfNotSet(firstPong)
+	var ri *routeInfo
+	// When receiving the first PONG, for a route with pooling, we may be
+	// instructed to start a new route.
+	if firstPong && c.kind == ROUTER && c.route != nil {
+		ri = c.route.startNewRoute
+		c.route.startNewRoute = nil
+	}
 	// If compression is currently active for a route/leaf connection, if the
 	// compression configuration is s2_auto, check if we should change
 	// the compression level.
@@ -2589,6 +2662,11 @@ func (c *client) processPong() {
 	c.mu.Unlock()
 	if reorderGWs {
 		srv.gateway.orderOutboundConnections()
+	}
+	if ri != nil {
+		srv.startGoRoutine(func() {
+			srv.connectToRoute(ri.url, ri.rtype, true, ri.gossipMode, _EMPTY_)
+		})
 	}
 }
 
@@ -3093,6 +3171,13 @@ func (c *client) addShadowSub(sub *subscription, ime *ime, enact bool) (*subscri
 	// Update our route map here. But only if we are not a leaf node or a hub leafnode.
 	if c.kind != LEAF || c.isHubLeafNode() {
 		c.srv.updateRemoteSubscription(im.acc, &nsub, 1)
+	} else if c.kind == LEAF {
+		// Update all leafnodes that connect to this server. Note that we could have
+		// used the updateLeafNodes() function since when it does invoke updateSmap()
+		// this function already takes care of not sending to a spoke leafnode since
+		// the `nsub` here is already from a spoke leafnode, but to be explicit, we
+		// use this version that updates only leafnodes that connect to this server.
+		im.acc.updateLeafNodesEx(&nsub, 1, true)
 	}
 
 	return &nsub, nil
@@ -3201,14 +3286,12 @@ func (c *client) unsubscribe(acc *Account, sub *subscription, force, remove bool
 
 	// Check to see if we have shadow subscriptions.
 	var updateRoute bool
-	var updateGWs bool
+	var isSpokeLeaf bool
 	shadowSubs := sub.shadow
 	sub.shadow = nil
 	if len(shadowSubs) > 0 {
-		updateRoute = (c.kind == CLIENT || c.kind == SYSTEM || c.kind == LEAF) && c.srv != nil
-		if updateRoute {
-			updateGWs = c.srv.gateway.enabled
-		}
+		isSpokeLeaf = c.isSpokeLeafNode()
+		updateRoute = !isSpokeLeaf && (c.kind == CLIENT || c.kind == SYSTEM || c.kind == LEAF) && c.srv != nil
 	}
 	sub.close()
 	c.mu.Unlock()
@@ -3217,16 +3300,12 @@ func (c *client) unsubscribe(acc *Account, sub *subscription, force, remove bool
 	for _, nsub := range shadowSubs {
 		if err := nsub.im.acc.sl.Remove(nsub); err != nil {
 			c.Debugf("Could not remove shadow import subscription for account %q", nsub.im.acc.Name)
-		} else {
-			if updateRoute {
-				c.srv.updateRouteSubscriptionMap(nsub.im.acc, nsub, -1)
-			}
-			if updateGWs {
-				c.srv.gatewayUpdateSubInterest(nsub.im.acc.Name, nsub, -1)
-			}
 		}
-		// Now check on leafnode updates.
-		nsub.im.acc.updateLeafNodes(nsub, -1)
+		if updateRoute {
+			c.srv.updateRemoteSubscription(nsub.im.acc, nsub, -1)
+		} else if isSpokeLeaf {
+			nsub.im.acc.updateLeafNodesEx(nsub, -1, true)
+		}
 	}
 
 	// Now check to see if this was part of a respMap entry for service imports.
@@ -3463,6 +3542,12 @@ func (c *client) stalledWait(producer *client) {
 	c.mu.Unlock()
 	defer c.mu.Lock()
 
+	// Track per client and total client stalls.
+	atomic.AddInt64(&c.stalls, 1)
+	if c.srv != nil {
+		atomic.AddInt64(&c.srv.stalls, 1)
+	}
+
 	// Now check if we are close to total allowed.
 	if producer.in.tst+ttl > stallTotalAllowed {
 		ttl = stallTotalAllowed - producer.in.tst
@@ -3615,6 +3700,7 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 	// support we need to strip the headers from the payload.
 	// The actual header would have been processed correctly for us, so just
 	// need to update payload.
+	hdrSize := c.pa.hdr
 	if c.pa.hdr > 0 && !sub.client.headers {
 		msg = msg[c.pa.hdr:]
 	}
@@ -3756,6 +3842,7 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 
 	if client.trace {
 		client.traceOutOp(bytesToString(mh[:len(mh)-LEN_CR_LF]), nil)
+		client.traceMsgDelivery(msg, hdrSize)
 	}
 
 	client.mu.Unlock()
@@ -4191,7 +4278,8 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		c.mu.Lock()
 		if c.opts.NoResponders {
 			if sub := c.subForReply(c.pa.reply); sub != nil {
-				proto := fmt.Sprintf("HMSG %s %s 16 16\r\nNATS/1.0 503\r\n\r\n\r\n", c.pa.reply, sub.sid)
+				hdrLen := 32 /* header without the subject */ + len(c.pa.subject)
+				proto := fmt.Sprintf("HMSG %s %s %d %d\r\nNATS/1.0 503\r\nNats-Subject: %s\r\n\r\n\r\n", c.pa.reply, sub.sid, hdrLen, hdrLen, c.pa.subject)
 				c.queueOutbound([]byte(proto))
 				c.addToPCD(c)
 			}
@@ -5287,18 +5375,16 @@ func (c *client) pubPermissionViolation(subject []byte) {
 		mt.setIngressError(errTxt)
 	}
 	c.sendErr(errTxt)
-	c.Errorf("Publish Violation - %s, Subject %q", c.getAuthUser(), subject)
+	c.Errorf("Publish Violation - Subject %q", subject)
 }
 
 func (c *client) subPermissionViolation(sub *subscription) {
 	errTxt := fmt.Sprintf("Permissions Violation for Subscription to %q", sub.subject)
-	logTxt := fmt.Sprintf("Subscription Violation - %s, Subject %q, SID %s",
-		c.getAuthUser(), sub.subject, sub.sid)
+	logTxt := fmt.Sprintf("Subscription Violation - Subject %q, SID %s", sub.subject, sub.sid)
 
 	if sub.queue != nil {
 		errTxt = fmt.Sprintf("Permissions Violation for Subscription to %q using queue %q", sub.subject, sub.queue)
-		logTxt = fmt.Sprintf("Subscription Violation - %s, Subject %q, Queue: %q, SID %s",
-			c.getAuthUser(), sub.subject, sub.queue, sub.sid)
+		logTxt = fmt.Sprintf("Subscription Violation - Subject %q, Queue: %q, SID %s", sub.subject, sub.queue, sub.sid)
 	}
 
 	c.sendErr(errTxt)
@@ -5311,13 +5397,12 @@ func (c *client) replySubjectViolation(reply []byte) {
 		mt.setIngressError(errTxt)
 	}
 	c.sendErr(errTxt)
-	c.Errorf("Publish Violation - %s, Reply %q", c.getAuthUser(), reply)
+	c.Errorf("Publish Violation - Reply %q", reply)
 }
 
 func (c *client) maxTokensViolation(sub *subscription) {
 	errTxt := fmt.Sprintf("Permissions Violation for Subscription to %q, too many tokens", sub.subject)
-	logTxt := fmt.Sprintf("Subscription Violation Too Many Tokens - %s, Subject %q, SID %s",
-		c.getAuthUser(), sub.subject, sub.sid)
+	logTxt := fmt.Sprintf("Subscription Violation Too Many Tokens - Subject %q, SID %s", sub.subject, sub.sid)
 	c.sendErr(errTxt)
 	c.Errorf(logTxt)
 }
@@ -5636,10 +5721,8 @@ func (c *client) processSubsOnConfigReload(awcsti map[string]struct{}) {
 	// Unsubscribe all that need to be removed and report back to client and logs.
 	for _, sub := range removed {
 		c.unsubscribe(acc, sub, true, true)
-		c.sendErr(fmt.Sprintf("Permissions Violation for Subscription to %q (sid %q)",
-			sub.subject, sub.sid))
-		srv.Noticef("Removed sub %q (sid %q) for %s - not authorized",
-			sub.subject, sub.sid, c.getAuthUser())
+		c.sendErr(fmt.Sprintf("Permissions Violation for Subscription to %q (sid %q)", sub.subject, sub.sid))
+		srv.Noticef("Removed sub %q (sid %q) for %s - not authorized", sub.subject, sub.sid, c.getAuthUser())
 	}
 }
 
@@ -6240,6 +6323,22 @@ func (c *client) getAuthUser() string {
 	}
 }
 
+// getAuthUserLabel returns a label for the auth user for the client.
+func (c *client) getAuthUserLabel() string {
+	switch {
+	case c.opts.Nkey != _EMPTY_:
+		return fmt.Sprintf("nkey:%s", c.opts.Nkey)
+	case c.opts.Username != _EMPTY_:
+		return fmt.Sprintf("user:%s", c.opts.Username)
+	case c.opts.JWT != _EMPTY_:
+		return fmt.Sprintf("jwt:%s", c.pubKey)
+	case c.opts.Token != _EMPTY_:
+		return "token"
+	default:
+		return ""
+	}
+}
+
 // Given an array of strings, this function converts it to a map as long
 // as all the content (converted to upper-case) matches some constants.
 
@@ -6315,51 +6414,107 @@ func (c *client) isClosed() bool {
 	return c.flags.isSet(closeConnection) || c.flags.isSet(connMarkedClosed) || c.nc == nil
 }
 
+func (c *client) format(format string) string {
+	if s := c.String(); s != _EMPTY_ {
+		return fmt.Sprintf("%s - %s", s, format)
+	} else {
+		return format
+	}
+}
+
+func (c *client) formatNoClientInfo(format string) string {
+	acc := c.ncsAcc.Load()
+	if acc != nil {
+		return fmt.Sprintf("%s - Account:%s", format, acc)
+	} else {
+		return format
+	}
+}
+
+func (c *client) formatClientSuffix() string {
+	user := c.ncsUser.Load()
+	if user == nil || user.(string) == _EMPTY_ {
+		return _EMPTY_
+	}
+	return fmt.Sprintf(" - %s", user)
+}
+
 // Logging functionality scoped to a client or route.
 func (c *client) Error(err error) {
-	c.srv.Errors(c, err)
+	c.srv.Errorf(c.format(err.Error()))
 }
 
 func (c *client) Errorf(format string, v ...any) {
-	format = fmt.Sprintf("%s - %s", c, format)
-	c.srv.Errorf(format, v...)
+	c.srv.Errorf(c.format(format), v...)
 }
 
 func (c *client) Debugf(format string, v ...any) {
-	format = fmt.Sprintf("%s - %s", c, format)
-	c.srv.Debugf(format, v...)
+	c.srv.Debugf(c.format(format), v...)
 }
 
 func (c *client) Noticef(format string, v ...any) {
-	format = fmt.Sprintf("%s - %s", c, format)
-	c.srv.Noticef(format, v...)
+	c.srv.Noticef(c.format(format), v...)
 }
 
 func (c *client) Tracef(format string, v ...any) {
-	format = fmt.Sprintf("%s - %s", c, format)
-	c.srv.Tracef(format, v...)
+	c.srv.Tracef(c.format(format), v...)
 }
 
 func (c *client) Warnf(format string, v ...any) {
-	format = fmt.Sprintf("%s - %s", c, format)
-	c.srv.Warnf(format, v...)
+	c.srv.Warnf(c.format(format), v...)
+}
+
+func (c *client) RateLimitErrorf(format string, v ...any) {
+	// Do the check before adding the client info to the format...
+	statement := fmt.Sprintf(c.formatNoClientInfo(format), v...)
+	if _, loaded := c.srv.rateLimitLogging.LoadOrStore(statement, time.Now()); loaded {
+		return
+	}
+	if s := c.String(); s != _EMPTY_ {
+		c.srv.Errorf("%s - %s%s", c, statement, c.formatClientSuffix())
+	} else {
+		c.srv.Errorf("%s%s", statement, c.formatClientSuffix())
+	}
 }
 
 func (c *client) rateLimitFormatWarnf(format string, v ...any) {
+	// Do the check before adding the client info to the format...
+	format = c.formatNoClientInfo(format)
 	if _, loaded := c.srv.rateLimitLogging.LoadOrStore(format, time.Now()); loaded {
 		return
 	}
 	statement := fmt.Sprintf(format, v...)
-	c.Warnf("%s", statement)
+	if s := c.String(); s != _EMPTY_ {
+		c.srv.Warnf("%s - %s%s", c, statement, c.formatClientSuffix())
+	} else {
+		c.srv.Warnf("%s%s", statement, c.formatClientSuffix())
+	}
 }
 
 func (c *client) RateLimitWarnf(format string, v ...any) {
 	// Do the check before adding the client info to the format...
-	statement := fmt.Sprintf(format, v...)
+	statement := fmt.Sprintf(c.formatNoClientInfo(format), v...)
 	if _, loaded := c.srv.rateLimitLogging.LoadOrStore(statement, time.Now()); loaded {
 		return
 	}
-	c.Warnf("%s", statement)
+	if s := c.String(); s != _EMPTY_ {
+		c.srv.Warnf("%s - %s%s", c, statement, c.formatClientSuffix())
+	} else {
+		c.srv.Warnf("%s%s", statement, c.formatClientSuffix())
+	}
+}
+
+func (c *client) RateLimitDebugf(format string, v ...any) {
+	// Do the check before adding the client info to the format...
+	statement := fmt.Sprintf(c.formatNoClientInfo(format), v...)
+	if _, loaded := c.srv.rateLimitLogging.LoadOrStore(statement, time.Now()); loaded {
+		return
+	}
+	if s := c.String(); s != _EMPTY_ {
+		c.srv.Debugf("%s - %s%s", c, statement, c.formatClientSuffix())
+	} else {
+		c.srv.Debugf("%s%s", statement, c.formatClientSuffix())
+	}
 }
 
 // Set the very first PING to a lower interval to capture the initial RTT.
@@ -6397,4 +6552,19 @@ func (c *client) setFirstPingTimer() {
 		c.ping.tmr.Stop()
 	}
 	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
+}
+
+// Sets this error as the authentication error. To be used in authViolation()
+// to report an error different of `ErrAuthentication`.
+func (c *client) setAuthError(err error) {
+	c.mu.Lock()
+	c.authErr = err
+	c.mu.Unlock()
+}
+
+// Returns the authentication error set in the connection, possibly nil.
+func (c *client) getAuthError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authErr
 }

@@ -181,6 +181,16 @@ func TestTLSConfigFile(t *testing.T) {
 		t.Fatalf("Could not verify hostname in certificate: %v", err)
 	}
 
+	// First make sure that we can't add insecure cipher suites accidentally.
+	_, err = ProcessConfigFile("./configs/tls_insecure_ciphers.conf")
+	if err == nil || !strings.Contains(err.Error(), "insecure") {
+		t.Fatalf("Expected to receive insecure cipher error reading configuration file but didn't")
+	}
+	_, err = ProcessConfigFile("./configs/tls_insecure_ciphers_allowed.conf")
+	if err != nil {
+		t.Fatalf("Received an error reading config file: %v", err)
+	}
+
 	// Now test adding cipher suites.
 	opts, err = ProcessConfigFile("./configs/tls_ciphers.conf")
 	if err != nil {
@@ -193,15 +203,8 @@ func TestTLSConfigFile(t *testing.T) {
 
 	// CipherSuites listed in the config - test all of them.
 	ciphers = []uint16{
-		tls.TLS_RSA_WITH_RC4_128_SHA,
-		tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-		tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-		tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
-		tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
 		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
 		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
@@ -3749,4 +3752,172 @@ func parseConfigTolerantly(t *testing.T, data string) (*Options, error) {
 	}
 
 	return o, nil
+}
+
+func TestOptionsProxyTrustedKeys(t *testing.T) {
+	o := DefaultOptions()
+	o.Proxies = &ProxiesConfig{
+		Trusted: []*ProxyConfig{
+			{Key: "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3"},
+			{Key: "bad1"},
+			{Key: "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI"},
+			{Key: "bad2"},
+		},
+	}
+	err := validateOptions(o)
+	require_Error(t, err)
+	require_Equal(t, "proxy trusted key \"bad1\" is invalid", err.Error())
+
+	o.Proxies = &ProxiesConfig{
+		Trusted: []*ProxyConfig{
+			{Key: "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3"},
+			{Key: "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI"},
+		},
+	}
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	opts := s.getOpts()
+	for i, kp := range s.proxiesKeyPairs {
+		pub, err := kp.PublicKey()
+		require_NoError(t, err)
+		require_Equal(t, opts.Proxies.Trusted[i].Key, pub)
+	}
+}
+
+func TestOptionsProxyRequired(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		port: -1
+		authorization {
+			user: user
+			password: pwd
+			proxy_required: true
+		}
+	`))
+	o, err := ProcessConfigFile(conf)
+	require_NoError(t, err)
+	require_Equal(t, o.Username, "user")
+	require_Equal(t, o.Password, "pwd")
+	require_True(t, o.ProxyRequired)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		authorization {
+			users: [
+				{user: user1, password: pwd1}
+				{user: user2, password: pwd2, proxy_required: true}
+				{user: user3, password: pwd3, proxy_required: false}
+				{nkey: "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3", proxy_required: true}
+				{nkey: "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI", proxy_required: false}
+			]
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+
+	checkUsersAndNkeys := func(users []*User, hasNkeys bool, nkeys []*NkeyUser) {
+		t.Helper()
+		var found bool
+
+		require_Len(t, len(users), 3)
+		for _, u := range users {
+			switch u.Username {
+			case "user1", "user3":
+				require_False(t, u.ProxyRequired)
+			case "user2":
+				require_True(t, u.ProxyRequired)
+				found = true
+			}
+		}
+		require_True(t, found)
+
+		if !hasNkeys {
+			return
+		}
+
+		found = false
+		require_Len(t, len(nkeys), 2)
+		for _, u := range nkeys {
+			switch u.Nkey {
+			case "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3":
+				require_True(t, u.ProxyRequired)
+				found = true
+			case "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI":
+				require_False(t, u.ProxyRequired)
+			}
+		}
+		require_True(t, found)
+	}
+	checkUsersAndNkeys(o.Users, true, o.Nkeys)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		accounts {
+			A {
+				users: [
+					{user: user1, password: pwd1}
+					{user: user2, password: pwd2, proxy_required: true}
+					{user: user3, password: pwd3, proxy_required: false}
+					{nkey: "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3", proxy_required: true}
+					{nkey: "UD6AYQSOIN2IN5OGC6VQZCR4H3UFMIOXSW6NNS6N53CLJA4PB56CEJJI", proxy_required: false}
+				]
+			}
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+	require_Len(t, len(o.Accounts), 1)
+	require_Equal(t, o.Accounts[0].Name, "A")
+	checkUsersAndNkeys(o.Users, true, o.Nkeys)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		leafnodes {
+			port: -1
+			authorization {
+				user: user
+				password: pwd
+				proxy_required: true
+			}
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+	require_Equal(t, o.LeafNode.Username, "user")
+	require_Equal(t, o.LeafNode.Password, "pwd")
+	require_True(t, o.LeafNode.ProxyRequired)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		leafnodes {
+			port: -1
+			authorization {
+				nkey: "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3"
+				proxy_required: true
+			}
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+	require_Equal(t, o.LeafNode.Nkey, "UCARKS2E3KVB7YORL2DG34XLT7PUCOL2SVM7YXV6ETHLW6Z46UUJ2VZ3")
+	require_True(t, o.LeafNode.ProxyRequired)
+
+	conf = createConfFile(t, []byte(`
+		port: -1
+		leafnodes: {
+			port: -1
+			authorization {
+				users: [
+					{user: user1, password: pwd1}
+					{user: user2, password: pwd2, proxy_required: true}
+					{user: user3, password: pwd3, proxy_required: false}
+				]
+			}
+		}
+	`))
+	o, err = ProcessConfigFile(conf)
+	require_NoError(t, err)
+	checkUsersAndNkeys(o.LeafNode.Users, false, nil)
 }

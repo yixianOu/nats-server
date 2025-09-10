@@ -129,6 +129,7 @@ type ConnInfo struct {
 	OutMsgs        int64          `json:"out_msgs"`
 	InBytes        int64          `json:"in_bytes"`
 	OutBytes       int64          `json:"out_bytes"`
+	Stalls         int64          `json:"stalls,omitempty"`
 	NumSubs        uint32         `json:"subscriptions"`
 	Name           string         `json:"name,omitempty"`
 	Lang           string         `json:"lang,omitempty"`
@@ -146,9 +147,15 @@ type ConnInfo struct {
 	NameTag        string         `json:"name_tag,omitempty"`
 	Tags           jwt.TagList    `json:"tags,omitempty"`
 	MQTTClient     string         `json:"mqtt_client,omitempty"` // This is the MQTT client id
+	Proxy          *ProxyInfo     `json:"proxy,omitempty"`
 
 	// Internal
 	rtt int64 // For fast sorting
+}
+
+// ProxyInfo represents the information about this proxied connection.
+type ProxyInfo struct {
+	Key string `json:"key"`
 }
 
 // TLSPeerCert contains basic information about a TLS peer certificate
@@ -571,6 +578,8 @@ func (ci *ConnInfo) fill(client *client, nc net.Conn, now time.Time, auth bool) 
 	// we need to use atomic here.
 	ci.InMsgs = atomic.LoadInt64(&client.inMsgs)
 	ci.InBytes = atomic.LoadInt64(&client.inBytes)
+	ci.Stalls = atomic.LoadInt64(&client.stalls)
+	ci.Proxy = createProxyInfo(client)
 
 	// If the connection is gone, too bad, we won't set TLSVersion and TLSCipher.
 	// Exclude clients that are still doing handshake so we don't block in
@@ -579,7 +588,7 @@ func (ci *ConnInfo) fill(client *client, nc net.Conn, now time.Time, auth bool) 
 		if conn, ok := nc.(*tls.Conn); ok {
 			cs := conn.ConnectionState()
 			ci.TLSVersion = tlsVersion(cs.Version)
-			ci.TLSCipher = tlsCipher(cs.CipherSuite)
+			ci.TLSCipher = tls.CipherSuiteName(cs.CipherSuite)
 			if auth && len(cs.PeerCertificates) > 0 {
 				ci.TLSPeerCerts = makePeerCerts(cs.PeerCertificates)
 			}
@@ -591,6 +600,17 @@ func (ci *ConnInfo) fill(client *client, nc net.Conn, now time.Time, auth bool) 
 		ci.Port = int(client.port)
 		ci.IP = client.host
 	}
+}
+
+// If this client came from a trusted proxy, this will return a ProxyInfo
+// to be used in ConnInfo or LeafInfo.
+//
+// Client lock must be held on entry.
+func createProxyInfo(c *client) *ProxyInfo {
+	if c.proxyKey == _EMPTY_ {
+		return nil
+	}
+	return &ProxyInfo{Key: c.proxyKey}
 }
 
 func makePeerCerts(pc []*x509.Certificate) []*TLSPeerCert {
@@ -1209,9 +1229,9 @@ type Varz struct {
 	PingInterval          time.Duration          `json:"ping_interval"`                     // PingInterval is the interval the server will send PING messages during periods of inactivity on a connection
 	MaxPingsOut           int                    `json:"ping_max"`                          // MaxPingsOut is the number of unanswered PINGs after which the connection will be considered stale
 	HTTPHost              string                 `json:"http_host"`                         // HTTPHost is the HTTP host monitoring connections are accepted on
-	HTTPPort              int                    `json:"http_port"`                         // HTTPPort is the port monitoring connections are accpted on
+	HTTPPort              int                    `json:"http_port"`                         // HTTPPort is the port monitoring connections are accepted on
 	HTTPBasePath          string                 `json:"http_base_path"`                    // HTTPBasePath is the path prefix for access to monitor endpoints
-	HTTPSPort             int                    `json:"https_port"`                        // HTTPSHost is the HTTPS host monitoring connections are accepted on`
+	HTTPSPort             int                    `json:"https_port"`                        // HTTPSPort is the HTTPS host monitoring connections are accepted on`
 	AuthTimeout           float64                `json:"auth_timeout"`                      // AuthTimeout is the amount of seconds connections have to complete authentication
 	MaxControlLine        int32                  `json:"max_control_line"`                  // MaxControlLine is the amount of bytes a signal control message may be
 	MaxPayload            int                    `json:"max_payload"`                       // MaxPayload is the maximum amount of bytes a message may have as payload
@@ -1220,7 +1240,7 @@ type Varz struct {
 	Gateway               GatewayOptsVarz        `json:"gateway,omitempty"`                 // Gateway is the Super Cluster state
 	LeafNode              LeafNodeOptsVarz       `json:"leaf,omitempty"`                    // LeafNode is the Leafnode state
 	MQTT                  MQTTOptsVarz           `json:"mqtt,omitempty"`                    // MQTT is the MQTT state
-	Websocket             WebsocketOptsVarz      `json:"websocket,omitempty"`               // Websocket is the Webscocket client state
+	Websocket             WebsocketOptsVarz      `json:"websocket,omitempty"`               // Websocket is the Websocket client state
 	JetStream             JetStreamVarz          `json:"jetstream,omitempty"`               // JetStream is the JetStream state
 	TLSTimeout            float64                `json:"tls_timeout"`                       // TLSTimeout is how long TLS operations have to complete
 	WriteDeadline         time.Duration          `json:"write_deadline"`                    // WriteDeadline is the maximum time writes to sockets have to complete
@@ -1242,6 +1262,8 @@ type Varz struct {
 	InBytes               int64                  `json:"in_bytes"`                          // InBytes is the number of bytes this server received
 	OutBytes              int64                  `json:"out_bytes"`                         // OutMsgs is the number of bytes this server sent
 	SlowConsumers         int64                  `json:"slow_consumers"`                    // SlowConsumers is the total count of clients that were disconnected since start due to being slow consumers
+	StaleConnections      int64                  `json:"stale_connections"`                 // StaleConnections is the total count of stale connections that were detected
+	StalledClients        int64                  `json:"stalled_clients"`                   // StalledClients is the total number of times that clients have been stalled.
 	Subscriptions         uint32                 `json:"subscriptions"`                     // Subscriptions is the count of active subscriptions
 	HTTPReqStats          map[string]uint64      `json:"http_req_stats"`                    // HTTPReqStats is the number of requests each HTTP endpoint received
 	ConfigLoadTime        time.Time              `json:"config_load_time"`                  // ConfigLoadTime is the time the configuration was loaded or reloaded
@@ -1252,8 +1274,10 @@ type Varz struct {
 	TrustedOperatorsClaim []*jwt.OperatorClaims  `json:"trusted_operators_claim,omitempty"` // TrustedOperatorsClaim is the decoded claims for each trusted operator
 	SystemAccount         string                 `json:"system_account,omitempty"`          // SystemAccount is the name of the System account
 	PinnedAccountFail     uint64                 `json:"pinned_account_fails,omitempty"`    // PinnedAccountFail is how often user logon fails due to the issuer account not being pinned.
-	OCSPResponseCache     *OCSPResponseCacheVarz `json:"ocsp_peer_cache,omitempty"`         // OCSPResponseCache is the state of the OSCAP cache // OCSPResponseCache holds information about
-	SlowConsumersStats    *SlowConsumersStats    `json:"slow_consumer_stats"`               // SlowConsumersStats is statistics about all detected Slow Consumer
+	OCSPResponseCache     *OCSPResponseCacheVarz `json:"ocsp_peer_cache,omitempty"`         // OCSPResponseCache is the state of the OCSP cache
+	SlowConsumersStats    *SlowConsumersStats    `json:"slow_consumer_stats"`               // SlowConsumersStats are statistics about all detected Slow Consumer
+	StaleConnectionStats  *StaleConnectionStats  `json:"stale_connection_stats,omitempty"`  // StaleConnectionStats are statistics about all detected Stale Connections
+	Proxies               *ProxiesOptsVarz       `json:"proxies,omitempty"`                 // Proxies hold information about network proxy devices
 }
 
 // JetStreamVarz contains basic runtime information about jetstream
@@ -1370,6 +1394,16 @@ type OCSPResponseCacheVarz struct {
 	Unknowns  int64  `json:"cached_unknown_responses,omitempty"` // Unknowns  is how many of the stored cache entries are unknown responses
 }
 
+// ProxiesOptsVarz contains proxies information
+type ProxiesOptsVarz struct {
+	Trusted []*ProxyOptsVarz `json:"trusted,omitempty"` // Trusted holds a list of trusted proxies
+}
+
+// ProxyOptsVarz contains proxy information
+type ProxyOptsVarz struct {
+	Key string `json:"key"` // Key is the public key of the proxy
+}
+
 // VarzOptions are the options passed to Varz().
 // Currently, there are no options defined.
 type VarzOptions struct{}
@@ -1380,6 +1414,14 @@ type SlowConsumersStats struct {
 	Routes   uint64 `json:"routes"`   // Routes is how many Routes were slow consumers
 	Gateways uint64 `json:"gateways"` // Gateways is how many Gateways were slow consumers
 	Leafs    uint64 `json:"leafs"`    // Leafs is how many Leafnodes were slow consumers
+}
+
+// StaleConnectionStats contains information about the stale connections from different type of connections.
+type StaleConnectionStats struct {
+	Clients  uint64 `json:"clients"`  // Clients is how many Client connections became stale connections
+	Routes   uint64 `json:"routes"`   // Routes is how many Route connections became stale connections
+	Gateways uint64 `json:"gateways"` // Gateways is how many Gateway connections became stale connections
+	Leafs    uint64 `json:"leafs"`    // Leafs is how many Leafnode connections became stale connections
 }
 
 func myUptime(d time.Duration) string {
@@ -1437,6 +1479,8 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 		a.last { padding-bottom: 16px }
 		a.version { font-size: 14; font-weight: 400; width: 312px; text-align: right; margin-top: -2rem }
 		a.version:hover { color: rgb(22 22 32) }
+		.endpoint { font-size: 12px; color: #999; font-family: monospace; display: none }
+		a:hover .endpoint { display: inline }
 
 	</style>
 	</head>
@@ -1447,17 +1491,17 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 
 	</div>
 	<br/>
-	<a href=.%s>General (%s)</a>
-	<a href=.%s>JetStream (%s)</a>
-	<a href=.%s>Connections (%s)</a>
-	<a href=.%s>Accounts (%s)</a>
-	<a href=.%s>Account Stats (%s)</a>
-	<a href=.%s>Subscriptions (%s)</a>
-	<a href=.%s>Routes (%s)</a>
-	<a href=.%s>LeafNodes (%s)</a>
-	<a href=.%s>Gateways (%s)</a>
-	<a href=.%s>Raft Groups (%s)</a>
-	<a href=.%s class=last>Health Probe (%s)</a>
+	<a href=.%s>General<span class="endpoint"> %s</span></a>
+	<a href=.%s>JetStream<span class="endpoint"> %s</span></a>
+	<a href=.%s>Connections<span class="endpoint"> %s</span></a>
+	<a href=.%s>Accounts<span class="endpoint"> %s</span></a>
+	<a href=.%s>Account Stats<span class="endpoint"> %s</span></a>
+	<a href=.%s>Subscriptions<span class="endpoint"> %s</span></a>
+	<a href=.%s>Routes<span class="endpoint"> %s</span></a>
+	<a href=.%s>LeafNodes<span class="endpoint"> %s</span></a>
+	<a href=.%s>Gateways<span class="endpoint"> %s</span></a>
+	<a href=.%s>Raft Groups<span class="endpoint"> %s</span></a>
+	<a href=.%s class=last>Health Probe<span class="endpoint"> %s</span></a>
     <a href=https://docs.nats.io/running-a-nats-service/nats_admin/monitoring class="help">Help</a>
   </body>
 </html>`,
@@ -1718,6 +1762,19 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 	v.Websocket.TLSPinnedCerts = getPinnedCertsAsSlice(opts.Websocket.TLSPinnedCerts)
 
 	v.TLSOCSPPeerVerify = s.ocspPeerVerify && v.TLSRequired && s.opts.tlsConfigOpts != nil && s.opts.tlsConfigOpts.OCSPPeerConfig != nil && s.opts.tlsConfigOpts.OCSPPeerConfig.Verify
+
+	if opts.Proxies != nil {
+		if v.Proxies == nil {
+			v.Proxies = &ProxiesOptsVarz{}
+		}
+		trusted := make([]*ProxyOptsVarz, 0, len(opts.Proxies.Trusted))
+		for _, t := range opts.Proxies.Trusted {
+			trusted = append(trusted, &ProxyOptsVarz{Key: t.Key})
+		}
+		v.Proxies.Trusted = trusted
+	} else {
+		v.Proxies = nil
+	}
 }
 
 func getPinnedCertsAsSlice(certs PinnedCertSet) []string {
@@ -1756,11 +1813,19 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 	v.OutMsgs = atomic.LoadInt64(&s.outMsgs)
 	v.OutBytes = atomic.LoadInt64(&s.outBytes)
 	v.SlowConsumers = atomic.LoadInt64(&s.slowConsumers)
+	v.StalledClients = atomic.LoadInt64(&s.stalls)
 	v.SlowConsumersStats = &SlowConsumersStats{
 		Clients:  s.NumSlowConsumersClients(),
 		Routes:   s.NumSlowConsumersRoutes(),
 		Gateways: s.NumSlowConsumersGateways(),
 		Leafs:    s.NumSlowConsumersLeafs(),
+	}
+	v.StaleConnections = atomic.LoadInt64(&s.staleConnections)
+	v.StaleConnectionStats = &StaleConnectionStats{
+		Clients:  s.NumStaleConnectionsClients(),
+		Routes:   s.NumStaleConnectionsRoutes(),
+		Gateways: s.NumStaleConnectionsGateways(),
+		Leafs:    s.NumStaleConnectionsLeafs(),
 	}
 	v.PinnedAccountFail = atomic.LoadUint64(&s.pinnedAccFail)
 
@@ -2252,20 +2317,22 @@ type LeafzOptions struct {
 
 // LeafInfo has detailed information on each remote leafnode connection.
 type LeafInfo struct {
-	ID          uint64   `json:"id"`
-	Name        string   `json:"name"`
-	IsSpoke     bool     `json:"is_spoke"`
-	Account     string   `json:"account"`
-	IP          string   `json:"ip"`
-	Port        int      `json:"port"`
-	RTT         string   `json:"rtt,omitempty"`
-	InMsgs      int64    `json:"in_msgs"`
-	OutMsgs     int64    `json:"out_msgs"`
-	InBytes     int64    `json:"in_bytes"`
-	OutBytes    int64    `json:"out_bytes"`
-	NumSubs     uint32   `json:"subscriptions"`
-	Subs        []string `json:"subscriptions_list,omitempty"`
-	Compression string   `json:"compression,omitempty"`
+	ID          uint64     `json:"id"`
+	Name        string     `json:"name"`
+	IsSpoke     bool       `json:"is_spoke"`
+	IsIsolated  bool       `json:"is_isolated,omitempty"`
+	Account     string     `json:"account"`
+	IP          string     `json:"ip"`
+	Port        int        `json:"port"`
+	RTT         string     `json:"rtt,omitempty"`
+	InMsgs      int64      `json:"in_msgs"`
+	OutMsgs     int64      `json:"out_msgs"`
+	InBytes     int64      `json:"in_bytes"`
+	OutBytes    int64      `json:"out_bytes"`
+	NumSubs     uint32     `json:"subscriptions"`
+	Subs        []string   `json:"subscriptions_list,omitempty"`
+	Compression string     `json:"compression,omitempty"`
+	Proxy       *ProxyInfo `json:"proxy,omitempty"`
 }
 
 // Leafz returns a Leafz structure containing information about leafnodes.
@@ -2298,6 +2365,7 @@ func (s *Server) Leafz(opts *LeafzOptions) (*Leafz, error) {
 				ID:          ln.cid,
 				Name:        ln.leaf.remoteServer,
 				IsSpoke:     ln.isSpokeLeafNode(),
+				IsIsolated:  ln.leaf.isolated,
 				Account:     ln.acc.Name,
 				IP:          ln.host,
 				Port:        int(ln.port),
@@ -2308,6 +2376,7 @@ func (s *Server) Leafz(opts *LeafzOptions) (*Leafz, error) {
 				OutBytes:    ln.outBytes,
 				NumSubs:     uint32(len(ln.subs)),
 				Compression: ln.leaf.compression,
+				Proxy:       createProxyInfo(ln),
 			}
 			if opts != nil && opts.Subscriptions {
 				lni.Subs = make([]string, 0, len(ln.subs))
@@ -2520,6 +2589,10 @@ func (reason ClosedState) String() string {
 		return "Cluster Names Identical"
 	case Kicked:
 		return "Kicked"
+	case ProxyNotTrusted:
+		return "Proxy Not Trusted"
+	case ProxyRequired:
+		return "Proxy Required"
 	}
 
 	return "Unknown State"
@@ -2882,12 +2955,12 @@ type AccountDetail struct {
 
 // MetaClusterInfo shows information about the meta group.
 type MetaClusterInfo struct {
-	Name     string      `json:"name,omitempty"`
-	Leader   string      `json:"leader,omitempty"`
-	Peer     string      `json:"peer,omitempty"`
-	Replicas []*PeerInfo `json:"replicas,omitempty"`
-	Size     int         `json:"cluster_size"`
-	Pending  int         `json:"pending"`
+	Name     string      `json:"name,omitempty"`     // Name is the name of the cluster
+	Leader   string      `json:"leader,omitempty"`   // Leader is the server name of the cluster leader
+	Peer     string      `json:"peer,omitempty"`     // Peer is unique ID of the leader
+	Replicas []*PeerInfo `json:"replicas,omitempty"` // Replicas is a list of known peers
+	Size     int         `json:"cluster_size"`       // Size is the known size of the cluster
+	Pending  int         `json:"pending"`            // Pending is how many RAFT messages are not yet processed
 }
 
 // JSInfo has detailed information on JetStream.
@@ -3792,6 +3865,9 @@ func (s *Server) healthz(opts *HealthzOptions) *HealthStatus {
 		}
 
 		for stream, sa := range asa {
+			if sa != nil && sa.unsupported != nil {
+				continue
+			}
 			// Make sure we can look up
 			if err := js.isStreamHealthy(acc, sa); err != nil {
 				if !details {
@@ -3909,11 +3985,14 @@ type RaftzGroup struct {
 	Applied       uint64                    `json:"applied"`
 	CatchingUp    bool                      `json:"catching_up,omitempty"`
 	Leader        string                    `json:"leader,omitempty"`
+	LeaderSince   *time.Time                `json:"leader_since,omitempty"`
 	EverHadLeader bool                      `json:"ever_had_leader"`
 	Term          uint64                    `json:"term"`
 	Vote          string                    `json:"voted_for,omitempty"`
 	PTerm         uint64                    `json:"pterm"`
 	PIndex        uint64                    `json:"pindex"`
+	SystemAcc     bool                      `json:"system_account"`
+	TrafficAcc    string                    `json:"traffic_account"`
 	IPQPropLen    int                       `json:"ipq_proposal_len"`
 	IPQEntryLen   int                       `json:"ipq_entry_len"`
 	IPQRespLen    int                       `json:"ipq_resp_len"`
@@ -4014,11 +4093,14 @@ func (s *Server) Raftz(opts *RaftzOptions) *RaftzStatus {
 			Applied:       n.applied,
 			CatchingUp:    n.catchup != nil,
 			Leader:        n.leader,
+			LeaderSince:   n.leaderSince.Load(),
 			EverHadLeader: n.pleader.Load(),
 			Term:          n.term,
 			Vote:          n.vote,
 			PTerm:         n.pterm,
 			PIndex:        n.pindex,
+			SystemAcc:     n.IsSystemAccount(),
+			TrafficAcc:    n.acc.GetName(),
 			IPQPropLen:    n.prop.len(),
 			IPQEntryLen:   n.entry.len(),
 			IPQRespLen:    n.resp.len(),
